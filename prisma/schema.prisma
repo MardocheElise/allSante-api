@@ -1,0 +1,553 @@
+// ============================================================================
+// SCHÉMA ALL_SANTÉ — Dépôt national de santé
+// Base : allsante_global
+//
+// Périmètre : condensé interopérable partagé entre TOUS les établissements
+// affiliés. Ce n'est PAS un DPI ; c'est le socle qui permet à un patient d'être
+// reconnu et à son historique de le suivre d'un hôpital à l'autre.
+//
+// Clé pivot unique : matricule CMU (13 chiffres).
+// Aucun identifiant technique local (cuid SGCH/DPI) n'a de sens ici ; on
+// conserve à la place le couple (etablissementSourceId, referenceLocale) qui
+// rend toute republication IDEMPOTENTE.
+//
+// Ce qui NE remonte JAMAIS au national :
+//   • les analyses IA brutes (AnalyseIA, ResumeMedicalIA) — seul le diagnostic
+//     VALIDÉ par le médecin est publié ;
+//   • les brouillons de consultation (statut ≠ TERMINEE) ;
+//   • les champs de travail internes au DPI.
+// ============================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ─── Enums ───────────────────────────────────────────────────────────────────
+
+enum Genre {
+  masculin
+  feminin
+}
+
+enum TypeEtablissement {
+  CHU
+  CHR
+  HOPITAL_GENERAL
+  CENTRE_SANTE
+  CLINIQUE
+  LABORATOIRE
+}
+
+enum StatutConsultationNationale {
+  TERMINEE
+  CLOTUREE_ADMINISTRATIVEMENT
+  ANNULEE
+}
+
+enum ActionNationale {
+  LECTURE_IDENTITE
+  LECTURE_HISTORIQUE
+  LECTURE_SOCLE_VITAL
+  PUBLICATION_IDENTITE
+  PUBLICATION_CONSULTATION
+  PUBLICATION_SOCLE_VITAL
+
+  /// Routage du bus FHIR. Le bus est sans état, mais son ACTIVITÉ doit être
+  /// tracée : un journal qui ne consigne que les lectures d'identité ne
+  /// prouve pas qu'un Bundle a bien été remis, ni à qui.
+  ROUTAGE_PRISE_EN_CHARGE
+  ROUTAGE_DEMANDE_EXAMEN
+  ROUTAGE_RESULTATS
+  /// Le partenaire a envoyé du contenu clinique sans consentement valide :
+  /// rien n'a été écrit, mais la tentative est tracée.
+  REFUS_SANS_CONSENTEMENT
+  REVOCATION_CONSULTATION
+  MAJ_PREFERENCES_PARTAGE
+  REFUS_AUTHENTIFICATION
+}
+
+// ─── Modèle de partage à trois étages ────────────────────────────────────────
+//
+// La distinction n'est pas « sensible / non sensible » mais RISQUE VITAL contre
+// CHARGE SOCIALE. Une allergie à la pénicilline sauve une vie et n'expose
+// personne ; un diagnostic psychiatrique n'a aucune urgence et peut détruire
+// une réputation. Les deux ne peuvent pas suivre la même règle.
+
+enum EtagePartage {
+  /// Identité, groupe sanguin, allergies, traitements chroniques actifs.
+  /// Publié par défaut, patient informé, opposition possible.
+  SOCLE_VITAL
+
+  /// Motif, diagnostic, synthèse, résultats, prescriptions ponctuelles.
+  /// Publié UNIQUEMENT sur consentement explicite du patient.
+  EPISODE_SOIN
+
+  /// VIH, psychiatrie, IVG, addictions, violences. Consentement renforcé,
+  /// et l'existence même n'est jamais signalée à la lecture.
+  CHARGE_SOCIALE
+}
+
+enum PorteeConsentement {
+  /// Vaut pour la seule consultation du jour.
+  CONSULTATION_UNIQUE
+
+  /// Vaut pour les consultations à venir, jusqu'à révocation. Évite de
+  /// reposer la question à chaque passage — un médecin qui voit soixante
+  /// patients par jour finirait par cocher machinalement.
+  DURABLE
+}
+
+enum SupportConsentement {
+  /// Recueilli oralement par le praticien et consigné dans le DPI.
+  ORAL_TRACE_DPI
+
+  /// Formulaire signé, numérisé et archivé par l'établissement.
+  FORMULAIRE_PAPIER
+
+  /// Code reçu par SMS et saisi par le patient lui-même. Le support le plus
+  /// solide en cas de contestation, et le plus accessible sans smartphone.
+  SMS
+
+  /// Portail patient en ligne.
+  PORTAIL
+}
+
+// ─── Établissements affiliés ─────────────────────────────────────────────────
+
+model EtablissementNational {
+  id String @id @default(cuid())
+
+  /// Code court utilisé dans l'en-tête x-etablissement (ex. CHU-A, CHU-B).
+  code String            @unique
+  nom  String
+  type TypeEtablissement @default(HOPITAL_GENERAL)
+
+  ville String?
+  pays  String? @default("Côte d'Ivoire")
+
+  contactEmail String?
+  contactTel   String?
+
+  // ─── Systèmes de l'établissement (cibles de routage du bus FHIR) ──────────
+  //
+  // Le bus routait autrefois vers des URL figées dans la configuration, donc
+  // vers UN SEUL hôpital. Un Bundle émis par l'hôpital B partait vers le DPI
+  // de l'hôpital A : le patient admis à Bouaké apparaissait dans la file
+  // d'attente d'Abidjan.
+  //
+  // Ces adresses appartiennent à l'établissement, pas à All_Santé. Depuis que
+  // la garde authentifie l'appelant, le bus lui renvoie ses propres Bundles.
+
+  /// URL de base du DPI de cet établissement (ex. https://dpi.chr-bouake.ci).
+  dpiUrl      String?
+  /// URL de base de son système de laboratoire.
+  openelisUrl String?
+
+  /// Clé qu'All_Santé PRÉSENTE aux systèmes de cet établissement pour prouver
+  /// que le Bundle vient bien du bus.
+  ///
+  /// Stockée en clair, contrairement aux clés d'établissement dont on ne
+  /// garde que l'empreinte : celle-ci doit être REJOUÉE à chaque appel
+  /// sortant, et on ne peut pas rejouer un condensat. Le compromis est
+  /// assumé — c'est un secret partagé entre deux serveurs, pas un mot de
+  /// passe d'utilisateur.
+  cleSortante String?
+
+  actif Boolean @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  patientsEnregistres PatientNational[]       @relation("PatientEtablissementOrigine")
+  consultations       ConsultationNationale[] @relation("ConsultationEtablissementSource")
+  acces               JournalAccesNational[]
+  cles                CleApi[]
+  comptes             CompteDeveloppeur[]
+
+  @@index([actif])
+  @@map("etablissements_nationaux")
+}
+
+// ─── Portail développeur ─────────────────────────────────────────────────────
+//
+// Un établissement ne « déclare » pas son identité : il la PROUVE avec une clé
+// qui n'appartient qu'à lui. C'est ce qui rend le journal d'accès opposable —
+// sans quoi tracer « le CHR de Bouaké a ouvert ce dossier » ne prouve rien.
+
+model CompteDeveloppeur {
+  id String @id @default(cuid())
+
+  email        String @unique
+  motDePasseHash String
+
+  nom     String
+  prenom  String?
+  telephone String?
+  fonction  String?
+
+  /// Établissement auquel ce compte donne accès. Le code est dérivé du nom
+  /// saisi à l'inscription (« CHR de Bouaké » → « CHR-BOUAKE »).
+  etablissementId String
+  etablissement   EtablissementNational @relation(fields: [etablissementId], references: [id], onDelete: Cascade)
+
+  actif          Boolean   @default(true)
+  derniereConnexion DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  clesCreees CleApi[]
+
+  @@index([etablissementId])
+  @@map("comptes_developpeurs")
+}
+
+model CleApi {
+  id String @id @default(cuid())
+
+  etablissementId String
+  etablissement   EtablissementNational @relation(fields: [etablissementId], references: [id], onDelete: Cascade)
+
+  creeeParId String?
+  creeePar   CompteDeveloppeur? @relation(fields: [creeeParId], references: [id], onDelete: SetNull)
+
+  /// Libellé donné par le développeur (« intégration DPI », « tests »).
+  libelle String
+
+  /// Empreinte SHA-256 de la clé. La valeur en clair n'est JAMAIS stockée :
+  /// elle est affichée une seule fois, à la création. Perdue, elle se
+  /// remplace — elle ne se retrouve pas.
+  empreinte String @unique
+
+  /// Début lisible de la clé (« als_a1b2c3d4 »), pour qu'un développeur
+  /// identifie laquelle révoquer sans jamais la révéler entièrement.
+  prefixe String
+
+  /// Horodatage du dernier appel authentifié avec cette clé. Permet de
+  /// repérer une clé oubliée, et de vérifier qu'une rotation est terminée
+  /// avant de révoquer l'ancienne.
+  dernierUsageLe DateTime?
+
+  revoqueeLe DateTime?
+  motifRevocation String?
+
+  createdAt DateTime @default(now())
+
+  @@index([etablissementId, revoqueeLe])
+  @@map("cles_api")
+}
+
+// ─── Identité pivot ──────────────────────────────────────────────────────────
+
+model PatientNational {
+  id String @id @default(cuid())
+
+  /// Matricule CMU — 13 chiffres. UNIQUE au niveau national : c'est LA clé pivot.
+  matricule String @unique
+
+  nom           String
+  prenom        String?
+  genre         Genre
+  dateNaissance DateTime @db.Date
+  contact       String?
+
+  email                 String?
+  adresse               String?
+  villeCommune          String?
+  nationalite           String?
+  profession            String?
+  situationMatrimoniale String?
+  groupeSanguin         String?
+
+  assuranceNom    String?
+  assuranceNumero String?
+
+  /// Établissement qui a enregistré cette identité en premier.
+  etablissementOrigineId String?
+  etablissementOrigine   EtablissementNational? @relation("PatientEtablissementOrigine", fields: [etablissementOrigineId], references: [id], onDelete: SetNull)
+
+  /// Horodatage de la dernière identité reçue. Arbitre les publications
+  /// concurrentes de deux établissements : la plus récente l'emporte.
+  versionSource DateTime @default(now())
+
+  // ─── Préférences de partage ───────────────────────────────────────────────
+
+  /// Le patient a donné un accord DURABLE : ses consultations à venir sont
+  /// publiables sans reposer la question à chaque passage. Révocable.
+  partageDurable       Boolean   @default(false)
+  partageDurableDepuis DateTime?
+
+  /// Opposition au SOCLE VITAL (allergies, groupe sanguin, traitements
+  /// chroniques). Le socle est publié par défaut ; le patient garde le droit
+  /// de s'y opposer, en pleine connaissance du risque en situation d'urgence.
+  oppositionSocleVital     Boolean   @default(false)
+  oppositionSocleVitalLe   DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  consultations         ConsultationNationale[]
+  consentements         ConsentementPublication[]
+  allergies             AllergieNationale[]
+  traitementsChroniques TraitementChroniqueNational[]
+  acces                 JournalAccesNational[]
+
+  @@index([nom, prenom])
+  @@index([etablissementOrigineId])
+  @@map("patients_nationaux")
+}
+
+// ─── Consultations publiées par les DPI ──────────────────────────────────────
+
+model ConsultationNationale {
+  id String @id @default(cuid())
+
+  patientId String
+  /// Restrict : on ne supprime pas un dossier national par effet de bord.
+  patient   PatientNational @relation(fields: [patientId], references: [id], onDelete: Restrict)
+
+  etablissementSourceId String
+  etablissementSource   EtablissementNational @relation("ConsultationEtablissementSource", fields: [etablissementSourceId], references: [id], onDelete: Restrict)
+
+  /// Identifiant de la consultation DANS le DPI émetteur. Le couple
+  /// (etablissementSourceId, referenceLocale) rend la publication idempotente.
+  /// C'est le SEUL champ conservé quand le patient refuse le partage : il sert
+  /// de clé d'idempotence, et n'est jamais exposé en lecture.
+  referenceLocale String
+
+  // ─── Partage ──────────────────────────────────────────────────────────────
+
+  /// FAUX = le patient n'a pas consenti. La ligne existe comme simple marqueur,
+  /// et TOUS les champs cliniques ci-dessous restent NULL. Rien n'est stocké :
+  /// ce n'est pas du masquage en lecture, c'est de la minimisation à la source.
+  partage Boolean @default(false)
+
+  /// Étage de sensibilité. CHARGE_SOCIALE n'est jamais signalé à la lecture,
+  /// même comme « élément non partagé » — l'existence d'un secret est déjà
+  /// une information.
+  etage EtagePartage @default(EPISODE_SOIN)
+
+  // ─── Contenu clinique (NULL si partage = false) ───────────────────────────
+
+  dateConsultation DateTime?
+  motif            String?
+  professionnel    String?
+  specialite       String?
+  typeVisite       String?
+
+  statut StatutConsultationNationale @default(TERMINEE)
+
+  /// Diagnostic VALIDÉ par le médecin — jamais une suggestion IA non validée.
+  diagnosticRetenu String?
+  /// Codification CIM-10 si disponible.
+  codeCim10        String?
+  /// Synthèse clinique courte destinée au confrère qui reprendra le patient.
+  syntheseClinique String?
+  conduiteATenir   String?
+
+  /// Renseignés si le patient est revenu sur son accord. Le contenu clinique
+  /// est alors purgé et la ligne redevient un simple marqueur.
+  revoqueeLe  DateTime?
+  motifRevocation String?
+
+  publieLe  DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  prescriptions PrescriptionNationale[]
+  resultats     ResultatExamenNational[]
+  consentements ConsentementPublication[]
+
+  @@unique([etablissementSourceId, referenceLocale])
+  @@index([patientId, dateConsultation])
+  @@index([patientId, partage])
+  @@index([dateConsultation])
+  @@map("consultations_nationales")
+}
+
+// ─── Traçabilité du consentement ─────────────────────────────────────────────
+//
+// Un consentement non tracé n'existe pas : si le patient conteste dans deux
+// ans, une case cochée dans un DPI ne prouve rien. On enregistre QUI l'a
+// recueilli, QUAND, SUR QUEL SUPPORT, et pour QUELLE PORTÉE.
+
+model ConsentementPublication {
+  id String @id @default(cuid())
+
+  patientId String
+  patient   PatientNational @relation(fields: [patientId], references: [id], onDelete: Cascade)
+
+  /// NULL pour un consentement DURABLE, qui ne vise aucune consultation
+  /// en particulier.
+  consultationId String?
+  consultation   ConsultationNationale? @relation(fields: [consultationId], references: [id], onDelete: SetNull)
+
+  /// Établissement dans lequel le consentement a été recueilli.
+  etablissementId String?
+
+  accorde Boolean
+  portee  PorteeConsentement  @default(CONSULTATION_UNIQUE)
+  support SupportConsentement @default(ORAL_TRACE_DPI)
+
+  /// Étages couverts par cet accord.
+  etages EtagePartage[]
+
+  /// Professionnel qui a recueilli l'accord, tel que déclaré par le DPI.
+  recueilliPar String
+  recueilliLe  DateTime
+
+  /// Référence de la preuve : numéro du formulaire numérisé, identifiant du
+  /// message SMS de confirmation, etc. Vide pour un accord oral.
+  preuve String?
+
+  revoqueLe  DateTime?
+  revoquePar String?
+
+  createdAt DateTime @default(now())
+
+  @@index([patientId, createdAt])
+  @@index([consultationId])
+  @@map("consentements_publication")
+}
+
+// ─── Socle vital ─────────────────────────────────────────────────────────────
+//
+// Les données qui sauvent une vie quand le patient ne peut pas parler. Volume
+// minuscule, aucune charge sociale, publiées par défaut. C'est ce socle qui
+// justifie le dépôt national à lui seul.
+
+model AllergieNationale {
+  id String @id @default(cuid())
+
+  patientId String
+  patient   PatientNational @relation(fields: [patientId], references: [id], onDelete: Cascade)
+
+  etablissementSourceId String
+  /// Identifiant de l'allergie dans le DPI émetteur (idempotence).
+  referenceLocale       String
+
+  libelle  String
+  /// medicamenteuse, alimentaire, environnementale...
+  type     String?
+  /// legere, moderee, severe, anaphylaxie
+  severite String?
+  reaction String?
+
+  /// Une allergie contredite par un test peut être désactivée sans être
+  /// effacée : l'historique de la contre-indication a une valeur clinique.
+  active Boolean @default(true)
+
+  declareeLe DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@unique([etablissementSourceId, referenceLocale])
+  @@index([patientId, active])
+  @@map("allergies_nationales")
+}
+
+model TraitementChroniqueNational {
+  id String @id @default(cuid())
+
+  patientId String
+  patient   PatientNational @relation(fields: [patientId], references: [id], onDelete: Cascade)
+
+  etablissementSourceId String
+  referenceLocale       String
+
+  medicament String
+  dci        String?
+  dosage     String?
+  posologie  String?
+  /// Motif du traitement au long cours (hypertension, diabète, épilepsie...).
+  indication String?
+
+  debutLe DateTime?
+  finLe   DateTime?
+  actif   Boolean   @default(true)
+
+  declareLe DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([etablissementSourceId, referenceLocale])
+  @@index([patientId, actif])
+  @@map("traitements_chroniques_nationaux")
+}
+
+// ─── Prescriptions rattachées ────────────────────────────────────────────────
+
+model PrescriptionNationale {
+  id String @id @default(cuid())
+
+  consultationId String
+  consultation   ConsultationNationale @relation(fields: [consultationId], references: [id], onDelete: Cascade)
+
+  medicament   String
+  dci          String?
+  dosage       String?
+  posologie    String?
+  voie         String?
+  dureeJours   Int?
+  instructions String?
+
+  createdAt DateTime @default(now())
+
+  @@index([consultationId])
+  @@map("prescriptions_nationales")
+}
+
+// ─── Résultats d'examens rattachés ───────────────────────────────────────────
+
+model ResultatExamenNational {
+  id String @id @default(cuid())
+
+  consultationId String
+  consultation   ConsultationNationale @relation(fields: [consultationId], references: [id], onDelete: Cascade)
+
+  libelle       String
+  categorie     String?
+  valeur        String?
+  unite         String?
+  valeurNormale String?
+  interpretation String?
+  anormal       Boolean?
+  dateResultat  DateTime?
+
+  createdAt DateTime @default(now())
+
+  @@index([consultationId])
+  @@map("resultats_examens_nationaux")
+}
+
+// ─── Piste d'audit ───────────────────────────────────────────────────────────
+
+model JournalAccesNational {
+  id String @id @default(cuid())
+
+  etablissementId String?
+  etablissement   EtablissementNational? @relation(fields: [etablissementId], references: [id], onDelete: SetNull)
+
+  patientId String?
+  patient   PatientNational? @relation(fields: [patientId], references: [id], onDelete: SetNull)
+
+  /// Matricule conservé en clair même si le patient n'existe pas encore :
+  /// une recherche infructueuse doit rester traçable.
+  matricule String?
+
+  action     ActionNationale
+  ressource  String?
+  succes     Boolean         @default(true)
+  motifEchec String?
+  adresseIp  String?
+  userAgent  String?
+
+  createdAt DateTime @default(now())
+
+  @@index([etablissementId])
+  @@index([patientId])
+  @@index([matricule])
+  @@index([createdAt])
+  @@map("journaux_acces_national")
+}

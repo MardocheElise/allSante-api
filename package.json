@@ -1,0 +1,53 @@
+{
+  "name": "allsante-api",
+  "version": "0.2.0",
+  "description": "All_Santé — bus d'interopérabilité FHIR R4 + dépôt national reliant SGCH, DPI et OpenELIS autour du matricule CMU.",
+  "author": "KRA Mardochée — ESATIC",
+  "license": "UNLICENSED",
+  "private": true,
+  "prisma": {
+    "seed": "ts-node prisma/seed-national.ts"
+  },
+  "scripts": {
+    "build": "nest build",
+    "start": "nest start",
+    "start:dev": "nest start --watch",
+    "start:prod": "node dist/main.js",
+    "lint": "eslint \"src/**/*.ts\" --fix",
+    "format": "prettier --write \"src/**/*.ts\"",
+    "db:generate": "prisma generate",
+    "db:migrate": "prisma migrate dev",
+    "db:push": "prisma db push",
+    "db:studio": "prisma studio",
+    "seed:national": "ts-node prisma/seed-national.ts",
+    "db:sync": "prisma migrate dev && prisma generate && ts-node prisma/seed-national.ts",
+    "db:reset": "prisma migrate reset --force && prisma generate"
+  },
+  "dependencies": {
+    "@nestjs/axios": "^3.1.3",
+    "@nestjs/common": "^10.4.15",
+    "@nestjs/config": "^3.3.0",
+    "@nestjs/core": "^10.4.15",
+    "@nestjs/jwt": "^10.2.0",
+    "@nestjs/platform-express": "^10.4.15",
+    "@prisma/adapter-pg": "^7.8.0",
+    "@prisma/client": "^7.8.0",
+    "axios": "^1.7.9",
+    "bcryptjs": "^2.4.3",
+    "dotenv": "^16.4.7",
+    "pg": "^8.22.0",
+    "reflect-metadata": "^0.2.2",
+    "rxjs": "^7.8.1"
+  },
+  "devDependencies": {
+    "@nestjs/cli": "^10.4.9",
+    "@types/bcryptjs": "^2.4.6",
+    "@types/express": "^5.0.0",
+    "@types/node": "^22.10.5",
+    "@types/pg": "^8.20.0",
+    "prisma": "^7.8.0",
+    "ts-loader": "^9.5.1",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.7.3"
+  }
+}
